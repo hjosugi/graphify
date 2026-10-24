@@ -2,36 +2,86 @@
 from __future__ import annotations
 
 
+import re
 from pathlib import Path
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 
 
 _FORTRAN_CPP_EXTS = {".F", ".F90", ".F95", ".F03", ".F08"}
 
+# A cpp `#include` directive at the start of a (optionally indented) line, in
+# either the `"..."` or `<...>` form. Matched on raw bytes before preprocessing.
+_INCLUDE_DIRECTIVE_RE = re.compile(
+    rb"^[ \t\f\v\r]*#[ \t\f\v\r]*(?:include(?:_next)?|import|embed)\b"
+)
+
+
+def _strip_include_directives(source: bytes) -> bytes:
+    """Blank every cpp `#include` directive, preserving line numbers.
+
+    cpp always searches the directory of the file being preprocessed for quoted
+    includes and always honours absolute include paths, regardless of
+    `-nostdinc`/`-I` — so a malicious capital-F Fortran source containing
+    `#include "/etc/passwd"` or `#include "../../../secret"` would inline
+    arbitrary host files into the graph we ship to the LLM and persist to disk
+    (GHSA-pcc4-rvhr-2pr8, CWE-22/73/200). The `-nostdinc -I /dev/null` mitigation
+    did not cover those two cases. Removing the directives entirely keeps macro
+    expansion (the reason capital-F files need cpp — `#ifdef MPI`, `#define
+    REAL8`) while making host-file reads impossible. Cross-file include fidelity
+    is lost, which is an acceptable trade for closing an arbitrary-read vector on
+    the default offline path. Each stripped line is blanked (not deleted) so
+    reported line numbers still match the original source.
+    """
+    return b"\n".join(
+        b"" if _INCLUDE_DIRECTIVE_RE.match(line) else line
+        for line in source.split(b"\n")
+    )
+
+
 def _cpp_preprocess(path: Path) -> bytes:
     """Run cpp -w -P on a capital-F Fortran file and return preprocessed bytes.
 
-    Falls back to raw file bytes if cpp is not available. Capital-F extensions
-    conventionally require C preprocessor expansion (#ifdef MPI, #define REAL8, etc.)
-    before parsing.
+    Falls back to (include-stripped) raw file bytes if cpp is not available.
+    Capital-F extensions conventionally require C preprocessor expansion
+    (#ifdef MPI, #define REAL8, etc.) before parsing.
 
-    Security (F-007): we pass `-nostdinc` and `-I /dev/null` so a malicious
-    source file containing `#include "/home/victim/.ssh/id_rsa"` (or any other
-    include directive) cannot inline arbitrary host files into the output that
-    we then ship to an LLM. Without these flags `cpp` happily resolves any
-    relative or absolute include path it can read, which is a corpus-side
-    file-exfiltration vector.
+    Security (GHSA-pcc4-rvhr-2pr8): every `#include` directive is stripped before
+    preprocessing (see `_strip_include_directives`) and the sanitized source is
+    fed to cpp on stdin, so cpp never opens the source file's directory or any
+    absolute/traversing include path — closing the corpus-side arbitrary
+    file-read/exfiltration vector that `-nostdinc -I /dev/null` alone left open.
+    Feeding stdin (rather than a file path) also removes the `-I/etc/x.F90`
+    argument-injection edge case entirely.
     """
     import shutil
     import subprocess
+    source = path.read_bytes()
+    # C translation phases can disguise directives with comments, spliced
+    # lines, digraphs or trigraphs. Use the existing raw-source fallback for
+    # these forms rather than trying to implement a second C preprocessor.
+    # Pragmas and filesystem-probing builtins are outside this safe subset.
+    if (
+        any(token in source for token in (
+            b"/*", b"%:", b"??", b"_Pragma", b"__pragma", b"__has_include"
+        ))
+        or re.search(rb"\\[ \t]*(?:\r?\n|\r)", source)
+    ):
+        return source
+    allowed = {
+        b"define", b"undef", b"if", b"ifdef", b"ifndef", b"elif", b"elifdef",
+        b"elifndef", b"else", b"endif", b"error", b"warning", b"line",
+        b"include", b"include_next", b"import", b"embed",
+    }
+    directives = re.findall(rb"(?m)^[ \t\f\v\r]*#[ \t\f\v\r]*([A-Za-z_]+)", source)
+    if any(directive not in allowed for directive in directives):
+        return source
+    safe = _strip_include_directives(source)
     if not shutil.which("cpp"):
-        return path.read_bytes()
+        return safe
     try:
-        # Pass an absolute path so a corpus file named like "-I/etc/x.F90" cannot
-        # be parsed by cpp as an option (cpp does not accept a "--" end-of-options
-        # terminator). An absolute path always begins with "/".
         result = subprocess.run(
-            ["cpp", "-w", "-P", "-nostdinc", "-I", "/dev/null", str(path.resolve())],
+            ["cpp", "-w", "-P", "-nostdinc", "-I", "/dev/null"],
+            input=safe,
             capture_output=True,
             timeout=30,
         )
@@ -39,7 +89,7 @@ def _cpp_preprocess(path: Path) -> bytes:
             return result.stdout
     except Exception:
         pass
-    return path.read_bytes()
+    return safe
 
 def extract_fortran(path: Path) -> dict:
     """Extract programs, modules, subroutines, functions, use statements, and calls from Fortran files.
@@ -98,6 +148,11 @@ def extract_fortran(path: Path) -> dict:
 
     file_nid = _make_id(str(path))
     add_node(file_nid, path.name, 1)
+
+    # (type_nid, implementing_procedure_name, line) for every type-bound
+    # procedure. Resolved after the whole tree is walked, once the module's
+    # internal procedures have their nodes.
+    type_bound_procs: list[tuple[str, str, int]] = []
 
     def _fortran_name(stmt_node) -> str | None:
         """Extract name from a *_statement node. Fortran is case-insensitive; lowercase."""
@@ -177,6 +232,23 @@ def extract_fortran(path: Path) -> dict:
                     if tgt != fn_nid:
                         add_edge(fn_nid, tgt, "references", var_line, context="return_type")
 
+    def _type_bound_impl_name(proc_stmt) -> str | None:
+        """The module procedure implementing a type-bound `procedure` statement.
+
+        `procedure :: area => circle_area` binds the method name `area` to the
+        implementation `circle_area` (a `binding` node with a `method_name`
+        child); `procedure :: scale` binds `scale` to a same-named procedure
+        (a bare `method_name` child)."""
+        binding = next((c for c in proc_stmt.children if c.type == "binding"), None)
+        if binding is not None:
+            mn = next((c for c in binding.children if c.type == "method_name"), None)
+            if mn is not None:
+                return _read_text(mn, source).lower()
+        mn = next((c for c in proc_stmt.children if c.type == "method_name"), None)
+        if mn is not None:
+            return _read_text(mn, source).lower()
+        return None
+
     def walk_calls(node, scope_nid: str) -> None:
         if node is None:
             return
@@ -251,6 +323,20 @@ def extract_fortran(path: Path) -> dict:
                     line = node.start_point[0] + 1
                     add_node(type_nid, type_name, line)
                     add_edge(scope_nid, type_nid, "defines", line)
+                    # Type-bound procedures in the `contains` section bind the
+                    # derived type to the module procedures that implement its
+                    # methods. Without this the binding was dropped and the type
+                    # sat in the graph with no link to its own methods.
+                    procs = next((c for c in node.children
+                                  if c.type == "derived_type_procedures"), None)
+                    if procs is not None:
+                        for stmt in procs.children:
+                            if stmt.type != "procedure_statement":
+                                continue
+                            impl = _type_bound_impl_name(stmt)
+                            if impl:
+                                type_bound_procs.append(
+                                    (type_nid, impl, stmt.start_point[0] + 1))
             return
 
         if t == "subroutine":
@@ -296,6 +382,15 @@ def extract_fortran(path: Path) -> dict:
             walk(child, scope_nid)
 
     walk(root, file_nid)
+
+    # Link each derived type to the procedures bound as its methods, now that
+    # the module's internal procedures have been given nodes. A binding to a
+    # procedure imported from another module resolves to a sourceless stub the
+    # corpus rewire can collapse (same treatment as parameter/return types).
+    for type_nid, impl_name, line in type_bound_procs:
+        tgt = ensure_named_node(impl_name, line)
+        if tgt != type_nid:
+            add_edge(type_nid, tgt, "method", line, context="type_bound_procedure")
 
     _stmt_headers = {
         "subroutine_statement", "function_statement",
